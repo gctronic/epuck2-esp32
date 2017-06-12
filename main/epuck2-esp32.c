@@ -44,13 +44,14 @@ static const char *TAG = "example";
 
 #define ESP_INTR_FLAG_DEFAULT 0
 
-#define SPI_BUFF_LEN 16
 #define IMAGE_BUFF_MAX_SIZE 320*240 //*2 // 153600
+#define SPI_COMMAND_SIZE 64
+#define SPI_DATA_HEADER_SIZE 4
+#define SPI_DATA_PAYLOAD_SIZE 4092
 
 #define PAYLOAD_SIZE 38400 //8192
 #define HEADER_SIZE 4
 #define PACKET_SIZE (PAYLOAD_SIZE + HEADER_SIZE)
-
 
 #define EXAMPLE_WIFI_SSID "Sunrise_2.4GHz_BDA268"
 #define EXAMPLE_WIFI_PASS "byr1pa3rs4T2"
@@ -59,7 +60,8 @@ static const char *TAG = "example";
 
 
 SemaphoreHandle_t xSemaphore = NULL, semImage = NULL;
-uint8_t imageBuff[IMAGE_BUFF_MAX_SIZE];
+//uint8_t imageBuff[IMAGE_BUFF_MAX_SIZE];
+uint8_t *imageBuff;
 uint8_t txBuff[PACKET_SIZE];
 
 /* FreeRTOS event group to signal when we are connected & ready to make a request */
@@ -294,48 +296,141 @@ void spi_task(void* arg) {
 	uint32_t i = 0;	
 	uint8_t error = 0;
 	uint16_t transCount = 0; // image size / SPI_BUFF_LEN
+	uint16_t checksum = 0;
+	uint8_t cmdIndex = 0;
+	uint8_t checksumIndex = 0;
+	spi_slave_transaction_t *rtrans;
+	
+	uint8_t* spiTxBuff = (uint8_t*) pvPortMallocCaps(SPI_COMMAND_SIZE, MALLOC_CAP_DMA);
+	uint8_t* spiRxBuff = (uint8_t*) pvPortMallocCaps(SPI_COMMAND_SIZE, MALLOC_CAP_DMA);
+	//uint8_t* spiRxBuff = (uint8_t*) pvPortMallocCaps(SPI_COMMAND_SIZE*2, MALLOC_CAP_DMA);
+	uint8_t* spiHeader = (uint8_t*) pvPortMallocCaps(SPI_DATA_HEADER_SIZE, MALLOC_CAP_DMA);
 
-	uint8_t* spiTxBuff = (uint8_t*) pvPortMallocCaps(SPI_BUFF_LEN, MALLOC_CAP_DMA);
-	uint8_t* spiRxBuff = (uint8_t*) pvPortMallocCaps(SPI_BUFF_LEN, MALLOC_CAP_DMA);
-
-	for(temp=0; temp<SPI_BUFF_LEN; temp++) {
-		spiTxBuff[temp] = (SPI_BUFF_LEN-1)-temp; // From (SPI_BUFF_LEN-1) to 0.
+	unsigned int bytesCount = 0;         
+	unsigned int packetId = 0;
+	unsigned int payloadSize = 0;
+	unsigned int expectedPacketId = 0;
+	uint16_t numPackets = 0;
+	uint32_t remainingBytes = 0;	
+	uint32_t spiDataIndex = 0;
+	uint8_t packetCount = 0;
+	uint8_t packetError = 0;
+	
+	checksum = 0;
+	spiTxBuff[0] = 0xAA;
+	spiTxBuff[1] = 0xBB;
+	checksum += spiTxBuff[0];
+	checksum += spiTxBuff[1];	
+	for(temp=2; temp<SPI_COMMAND_SIZE-1; temp++) {
+		spiTxBuff[temp] = temp+0x0A;
+		checksum += spiTxBuff[temp];
 	}
-	spiTxBuff[0]=0xAA;
-	spiTxBuff[1]=0xBB;
+	spiTxBuff[SPI_COMMAND_SIZE-1] = checksum&0xFF; // Block check character checksum.
 
 	spi_slave_transaction_t transaction;
 	memset(&transaction, 0, sizeof(transaction));
 	transaction.rx_buffer = spiRxBuff;
 	transaction.tx_buffer = spiTxBuff;
-	transaction.length = SPI_BUFF_LEN*8;
+	transaction.length = SPI_COMMAND_SIZE*8;
 	transaction.user=(void*)0;	// Optional user parameter for the callback.
+
+	//ret = spi_slave_queue_trans(VSPI_HOST, &transaction, portMAX_DELAY);
+	//assert(ret==ESP_OK);
+/*
+	for(;;) {
+		memset (spiRxBuff, 0xFF, SPI_COMMAND_SIZE);
+
+		// Send command.
+		transaction.tx_buffer = spiTxBuff;
+		transaction.rx_buffer = spiRxBuff;
+		transaction.length = SPI_COMMAND_SIZE*8;
+
+		ret = spi_slave_transmit(VSPI_HOST, &transaction, portMAX_DELAY); // Wait forever...
+		assert(ret==ESP_OK);
+		
+		for(i=0; i<SPI_COMMAND_SIZE; i++) {
+			printf("%d, ", spiRxBuff[i]);
+		}
+		printf("\r\n\n");
+						
+	}
+*/
 
 	for(;;) {
 		//vTaskDelay(1000 / portTICK_PERIOD_MS);
-		memset (spiRxBuff, 0, SPI_BUFF_LEN);
+		
 
-		// Send command...
+		gpio_set_level(21, 1);
+		// Send command.
+		memset (spiRxBuff, 0, SPI_COMMAND_SIZE);
 		transaction.tx_buffer = spiTxBuff;
 		transaction.rx_buffer = spiRxBuff;
+		transaction.length = SPI_COMMAND_SIZE*8;
+		gpio_set_level(21, 0);	
 
-		ret = spi_slave_transmit(VSPI_HOST, &transaction, portMAX_DELAY);	
+		ret = spi_slave_transmit(VSPI_HOST, &transaction, portMAX_DELAY); // Wait forever...
 		assert(ret==ESP_OK);
+		
+		/*
+		ret = spi_slave_get_trans_result(VSPI_HOST, &rtrans, portMAX_DELAY);
+		assert(ret==ESP_OK);
+		
+		if(cmdIndex == 0) {
+			cmdIndex = SPI_COMMAND_SIZE;
+			checksumIndex = 0;			
+		} else {
+			cmdIndex = 0;
+			checksumIndex = SPI_COMMAND_SIZE;
+		}
+		memset (&spiRxBuff[cmdIndex], 0, SPI_COMMAND_SIZE);
+		transaction.rx_buffer = &spiRxBuff[cmdIndex];
+		ret = spi_slave_queue_trans(VSPI_HOST, &transaction, portMAX_DELAY);
+		assert(ret==ESP_OK);
+		*/
+		
+		gpio_set_level(21, 1);
+		checksum = 0;
+		for(temp=0; temp<SPI_COMMAND_SIZE-1; temp++) {
+			checksum += spiRxBuff[checksumIndex+temp];
+		}
+		checksum = checksum &0xFF;
+		gpio_set_level(21, 0);		
+		if(checksum != spiRxBuff[checksumIndex+SPI_COMMAND_SIZE-1] || spiRxBuff[0]!=0xAA || spiRxBuff[1]!=0xBB) {
+			//printf(".");
+			continue;
+		}
+		//printf("\r\n");
+		
 		//for(i=0; i<10; i++) {
 		//	printf("%d, ", spiRxBuff[i]);
 		//}
 		//printf("\r\n\n");
-		printf("recv: %d, %d, %d, %d, %d, %d, %d\r\n", spiRxBuff[0], spiRxBuff[1], spiRxBuff[2], spiRxBuff[3], spiRxBuff[SPI_BUFF_LEN-3], spiRxBuff[SPI_BUFF_LEN-2], spiRxBuff[SPI_BUFF_LEN-1]);
-
-
-/*
-		// Receive image.
-		for(transCount=0; transCount<1200; transCount++) {
-			transaction.rx_buffer = &imageBuff[transCount*SPI_BUFF_LEN];
+		//printf("recv: %d, %d, %d, %d, %d, %d, %d\r\n", spiRxBuff[0], spiRxBuff[1], spiRxBuff[2], spiRxBuff[3], spiRxBuff[SPI_BUFF_LEN-3], spiRxBuff[SPI_BUFF_LEN-2], spiRxBuff[SPI_BUFF_LEN-1]);
+		
+		
+		//ret = spi_slave_get_trans_result(VSPI_HOST, &rtrans, portMAX_DELAY);
+		//assert(ret==ESP_OK);		
+		
+		
+		// Receive data.
+		numPackets = 76800/SPI_DATA_PAYLOAD_SIZE;
+		remainingBytes = 76800%SPI_DATA_PAYLOAD_SIZE;
+		spiDataIndex = 0;
+		
+		transaction.length = (SPI_DATA_PAYLOAD_SIZE*8);
+		for(packetId=0; packetId<numPackets; packetId++) {
+			transaction.rx_buffer = &imageBuff[spiDataIndex];
+			ret = spi_slave_transmit(VSPI_HOST, &transaction, portMAX_DELAY);
+			assert(ret==ESP_OK);
+			spiDataIndex += SPI_DATA_PAYLOAD_SIZE;			
+		}
+		if(remainingBytes > 0) {
+			transaction.length = (remainingBytes*8);
+			transaction.rx_buffer = &imageBuff[spiDataIndex];
 			ret = spi_slave_transmit(VSPI_HOST, &transaction, portMAX_DELAY);
 			assert(ret==ESP_OK);
 		}
-			
+		
 		error = 0;
 		id = 0;
 		for(i=0; i<76800; i++) {
@@ -349,13 +444,102 @@ void spi_task(void* arg) {
 				id++;
 			}
 		}
+		packetCount++;
+
 		if(error == 1) {
+			packetError++;
 			printf("data not received correctly\r\n");
 			printf("err: ind=%d, exp=%d, recv=%d\r\n", i, id, imageBuff[i]);
 		} else {
 			printf("data received correctly\r\n");
 		}
+		
+		if(packetCount == 50) {
+			printf("Total errors = %d [%.2f%%]\r\n", packetError, (float)packetError/(float)packetCount*100.0);
+			packetCount = 0;
+			packetError = 0;
+		}
+		
+		memset(imageBuff, 0, 76800);	
+		
+		/*
+		memset (spiRxBuff, 0, SPI_COMMAND_SIZE*2);
+		transaction.rx_buffer = spiRxBuff;
+		transaction.length = SPI_COMMAND_SIZE*8;
+		cmdIndex = 0;
+		ret = spi_slave_queue_trans(VSPI_HOST, &transaction, portMAX_DELAY);
+		assert(ret==ESP_OK);
+		*/
+		
+/*		
+		while(1) {
+
+			// Receive data header.
+			transaction.tx_buffer = NULL;
+			transaction.length = (SPI_DATA_HEADER_SIZE*8);
+			transaction.rx_buffer = spiHeader;
+			ret = spi_slave_transmit(VSPI_HOST, &transaction, portMAX_DELAY);
+			assert(ret==ESP_OK);
+			
+			packetId = spiHeader[0] + (spiHeader[1]<<8);
+			printf("packet id = %d\r\n", packetId);
+			
+			if(packetId == 0) { // A complete packet is received. This is the first fragment of the next packet.
+				expectedPacketId = 0;				
+
+				error = 0;
+				id = 0;
+				for(i=0; i<76800; i++) {
+					if(imageBuff[i] != id) {
+						error = 1;
+						break;
+					}
+					if(id == 255) {
+						id = 0;
+					} else {
+						id++;
+					}
+				}
+				if(error == 1) {
+					printf("data not received correctly\r\n");
+					printf("err: ind=%d, exp=%d, recv=%d\r\n", i, id, imageBuff[i]);
+				} else {
+					printf("data received correctly\r\n");
+				}
+				
+				memset(imageBuff, 0, 76800);
+				imageIndex = 0;
+				break;
+			}		
+			
+			// Receive data payload.
+			payloadSize = spiHeader[2] + (spiHeader[3]<<8);
+			printf("payload size = %d\r\n", payloadSize);
+			//std::cout << "payload size = " << std::dec << (int)payloadSize << "(" << std::dec << (int)rxBuff[2] << ", " << std::dec << (int)rxBuff[3] << ")" << std::endl;
+			if(expectedPacketId != packetId) {
+				break;
+				//std::cout << "wrong packet id: expected=" << expectedPacketId << ", received=" << packetId << std::endl;
+				//std::cout << "image index = " << imageIndex << std::endl;
+			}
+			expectedPacketId++;
+			transaction.length = (payloadSize*8);
+			transaction.rx_buffer = &imageBuff[imageIndex];
+			ret = spi_slave_transmit(VSPI_HOST, &transaction, portMAX_DELAY);
+			assert(ret==ESP_OK);
+			imageIndex += payloadSize;
+				
+		}
 */
+				
+		/*
+		for(transCount=0; transCount<76800/SPI_PACKET_SIZE; transCount++) {
+			transaction.rx_buffer = &imageBuff[transCount*SPI_PACKET_SIZE];
+			ret = spi_slave_transmit(VSPI_HOST, &transaction, portMAX_DELAY);
+			assert(ret==ESP_OK);
+		}
+		*/
+
+
 	}
 }
 
@@ -373,6 +557,11 @@ void app_main()
 
 	uint8_t id = 0;
 	uint32_t i = 0;
+	
+	imageBuff = (uint8_t*) pvPortMallocCaps(IMAGE_BUFF_MAX_SIZE, MALLOC_CAP_DMA);
+	if(imageBuff == NULL) {
+		printf("Cannot allocate image buffer\r\n");
+	}
 /*
 	for(i=0; i<IMAGE_BUFF_MAX_SIZE; i++) {
 		imageBuff[i] = id;
@@ -383,6 +572,10 @@ void app_main()
 		}
 	}
 */
+
+	// Configure GPIO21 as output pin for debug.
+	gpio_pad_select_gpio(21);
+	gpio_set_direction(21, GPIO_MODE_OUTPUT);
 
 	// Create the binary semaphores.
 	xSemaphore = xSemaphoreCreateBinary();
